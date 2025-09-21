@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / compressed files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+
+# Unit test / coverage
+.coverage
+.tox/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+/venv
+/env
+/bin/
+/include/
+/lib/
+/share/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS and system files
+.DS_Store
+Thumbs.db
+
+# Misc
+.cache/
+.history/
+
+# Log files
+*.log
+
+# Jupyter Notebook files
+.ipynb_checkpoints
+
+# Environment variables
+.env

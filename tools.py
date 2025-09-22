@@ -4,7 +4,7 @@ import requests
 from typing import List, Dict, Optional
 from datetime import datetime
 import json
-
+from database import SupabaseStorage
 # API Configuration
 EXPENSE_BASE = os.getenv('EXPENSE_API_BASE', 'http://localhost:3000/api')
 EXPENSE_API_KEY = os.getenv('EXPENSE_API_KEY', '')
@@ -15,39 +15,14 @@ HEADERS = {'Content-Type': 'application/json'}
 if EXPENSE_API_KEY:
     HEADERS['Authorization'] = f"Bearer {EXPENSE_API_KEY}"
 
-def create_expense(user_id: str, amount: float, description: str = 'expense', date: str = None) -> Dict:
-    """Create a new expense record"""
-    try:
-        # Use current date if none provided
-        if not date:
-            date = datetime.now().strftime('%Y-%m-%d')
-            
-        payload = {
-            'user_id': user_id, 
-            'amount': float(amount), 
-            'description': description, 
-            'date': date
-        }
-        
-        print(f"Creating expense: {payload}")
-        
-        resp = requests.post(
-            f"{EXPENSE_BASE}/expenses", 
-            json=payload, 
-            headers=HEADERS, 
-            timeout=10
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        print(f"Expense created successfully: {result}")
-        return result
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error creating expense: {e}")
-        return {"error": f"Failed to create expense: {str(e)}"}
-    except Exception as e:
-        print(f"Unexpected error creating expense: {e}")
-        return {"error": f"Unexpected error: {str(e)}"}
+db_storage=SupabaseStorage()
+
+def create_expense(user_id: str, amount: float, description: str, category_name: str, date: Optional[str] = None) -> Dict:
+    """
+    High-level function to create an expense.
+    It uses the SupabaseStorage instance to interact with the database.
+    """
+    return db_storage.add_expense(user_id, amount, description, category_name, date)
 
 def create_note(user_id: str, text: str) -> Dict:
     """Create a new note"""
@@ -74,31 +49,17 @@ def create_note(user_id: str, text: str) -> Dict:
         return {"error": f"Unexpected error: {str(e)}"}
 
 def fetch_expenses(user_id: str, limit: int = 20) -> List[Dict]:
-    """Fetch user's expense records via POST request"""
-    try:
-        payload = {"userId": user_id, "limit": limit}
-        print(f"Fetching expenses for user {user_id}, limit: {limit}")
+    """
+    High-level function to fetch expenses for a user.
+    """
+    return db_storage.get_expenses(user_id, limit)
 
-        resp = requests.post(
-            f"{EXPENSE_BASE}/fetchExpenses",
-            json=payload,
-            headers=HEADERS,
-            timeout=10
-        )
-        resp.raise_for_status()
-
-        result = resp.json()
-        expenses = result.get("expenses", [])  # because your API returns {userId, expenses}
-        print(f"Fetched {len(expenses)} expenses")
-
-        return expenses
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching expenses: {e}")
-        return [{"error": f"Failed to fetch expenses: {str(e)}"}]
-    except Exception as e:
-        print(f"Unexpected error fetching expenses: {e}")
-        return [{"error": f"Unexpected error: {str(e)}"}]
+    # except requests.exceptions.RequestException as e:
+    #     print(f"Error fetching expenses: {e}")
+    #     return [{"error": f"Failed to fetch expenses: {str(e)}"}]
+    # except Exception as e:
+    #     print(f"Unexpected error fetching expenses: {e}")
+    #     return [{"error": f"Unexpected error: {str(e)}"}]
 
 def fetch_notes(user_id: str, limit: int = 20) -> List[Dict]:
     """Fetch user's notes"""

@@ -2,70 +2,55 @@ import os
 import json
 import sys
 from pathlib import Path
+import asyncio
+import uvicorn
+import requests
+from typing import Optional, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from agent_setup import AGENT
-from typing import Optional
-import requests
-import uvicorn
-from langfuse import Langfuse, observe
 from dotenv import load_dotenv
+from langfuse import Langfuse,observe,get_client
+from langchain_core.messages import HumanMessage
 
-# =====================
-# Load environment vars
-# =====================
-BASE_DIR = Path(__file__).parent
-ENV_FILE = BASE_DIR / ".env"
-load_dotenv(ENV_FILE)
+# Import the modernized agent
+from agent_setup import AGENT
 
+# ==============================================================================
+# 1. Environment and Service Setup
+# ==============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+# Initialize Langfuse for observability
 langfuse = Langfuse(
-  secret_key="sk-lf-10c01020-7e8b-40c8-b5de-82c8c879c7f2",
-  public_key="pk-lf-998d5562-38ff-4bc7-a18d-913471a1a692",
-  host="https://cloud.langfuse.com"
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    host="https://cloud.langfuse.com"
 )
 
-# observe = langfuse.observe
-# print("langfuse",os.getenv("LANGFUSE_SECRET_KEY"))
-# =====================
-# Gemini health checker
-# =====================
-def check_gemini_connection():
-    """Check if Gemini API is reachable"""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        print("✗ No GOOGLE_API_KEY found in environment.")
-        return False
+# ==============================================================================
+# 2. FastAPI Application Setup
+# ==============================================================================
+app = FastAPI(
+    title="OneAgent API",
+    version="2.0.0",
+    description="An API powered by a modern LangGraph agent for financial tasks.",
+)
 
-    try:
-        # Minimal test call to Gemini
-        url = f"https://generativelanguage.googleapis.com/v1/models?key={api_key}"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            print(f"✓ Gemini API is reachable with {len(models)} models available")
-            return True
-    except requests.exceptions.RequestException as e:
-        print(f"✗ Gemini connection failed: {e}")
-    return False
-
-# =====================
-# FastAPI setup
-# =====================
-app = FastAPI(title="OneAgent", version="1.0.0")
-origins = [
-    "http://localhost:3000", # The origin for your Next.js app
-    "http://localhost",
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["http://localhost:3000", "http://localhost"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# ==============================================================================
+# 3. Pydantic Models for API Data Validation
+# ==============================================================================
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -76,87 +61,161 @@ class ChatResponse(BaseModel):
     message: str
     error: Optional[str] = None
 
-@app.get("/")
+# ==============================================================================
+# 4. Health Check and Utility Functions
+# ==============================================================================
+@app.get("/", tags=["Status"])
 async def root():
-    """Health check endpoint"""
-    return {"status": "running", "message": "Agentic Expense Agent is ready!"}
+    """A simple health check endpoint to confirm the server is running."""
+    return {"status": "running", "message": "Modern Agent API is ready!"}
 
-@app.get("/health")
+def check_gemini_connection() -> bool:
+    """Checks if the Google Gemini API is reachable with the provided key."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print("✗ No GOOGLE_API_KEY found in environment.")
+        return False
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        print("✓ Gemini API connection successful.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"✗ Gemini API connection failed: {e}")
+        return False
+
+@app.get("/health", tags=["Status"])
 async def health():
-    """Detailed health check for Gemini"""
-    gemini_status = check_gemini_connection()
+    """Provides a detailed health check of the API and its dependencies."""
+    gemini_ok = check_gemini_connection()
     return {
-        "status": "healthy" if gemini_status else "degraded",
-        "gemini": "connected" if gemini_status else "disconnected",
-        "model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        "status": "healthy" if gemini_ok else "degraded",
+        "dependencies": {
+            "gemini_api": "connected" if gemini_ok else "disconnected",
+        },
+        "agent_details": {
+            "model": "gemini-1.5-flash",
+            "architecture": "LangGraph",
+        },
     }
 
-# =====================
-# Chat endpoint
-# =====================
-@app.post("/chat")
-@observe(name="OneAgent Chat", as_type="generation")
+# ==============================================================================
+# 5. Core API Endpoints
+# ==============================================================================
+@app.post("/chat", tags=["Agent"])
+@observe(name="OneAgentChat API",capture_input=True,capture_output=True)
 async def chat(req: ChatRequest):
-    user_id = req.user_id
-    message = req.message
-    session_id = req.session_id or f"{user_id}:session"
+    """
+    Handles a non-streaming chat request with the agent.
+    This endpoint uses the agent's built-in memory, using session_id as the thread_id.
+    """
+    if not req.user_id or not req.message:
+        raise HTTPException(status_code=400, detail="user_id and message are required.")
 
-    # Input validation
-    if not user_id.strip():
-        raise HTTPException(status_code=400, detail="user_id is required")
-    if not message.strip():
-        raise HTTPException(status_code=400, detail="message is required")
+    session_id = req.session_id or f"user-{req.user_id}-thread"
+    # trace = langfuse.trace(name="OneAgentChat", user_id=req.user_id, session_id=session_id)
+    # span = trace.span(name="run-agent-invoke", input={"message": req.message})
 
     try:
-        print(f"Processing request for user {user_id}: {message}")
-
-        # Run the LangChain agent
-        result = AGENT.invoke(f"user_id={user_id}; {message}")
-
-        print(f"Agent response: {result}")
-
-        return {"processed_data": result['output'], "status": "ok"}
+        # The agent manages its own history using the `thread_id` in the config
+        config = {"configurable": {"thread_id": session_id}}
+        
+        # We only need to send the latest human message
+        initial_state = {"messages": [HumanMessage(content=req.message)]}
+        
+        # Asynchronously invoke the agent
+        final_state = await AGENT.ainvoke(initial_state, config=config)
+        
+        # The final response is the last message in the state
+        response_message = final_state['messages'][-1].content
+        
+        # span.end(output={"response": response_message})
+        # return ChatResponse(session_id=session_id, message=response_message)
+        return {"session_id":session_id, "message":response_message}
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"Agent error: {error_msg}")
+        print(f"Agent error for user {req.user_id}: {e}")
+        # span.end(level="ERROR", status_message=str(e))
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
-        return ChatResponse(
-            session_id=session_id,
-            message="I encountered an error processing your request. Please try again.",
-            error=error_msg,
-        )
 
-# =====================
-# Server entrypoint
-# =====================
+@app.post("/chat/stream", tags=["Agent"])
+@observe(name="OneAgentChat stream",capture_input=True,capture_output=True)
+async def chat_stream(req: ChatRequest):
+    """
+    Handles a streaming chat request, providing real-time updates from the agent's process.
+    """
+    if not req.user_id or not req.message:
+        raise HTTPException(status_code=400, detail="user_id and message are required.")
+    langfuse = get_client()
+    session_id = req.session_id or f"user-{req.user_id}-thread"
+    langfuse.update_current_trace(session_id=session_id)
+
+    config = {"configurable": {"thread_id": session_id}}
+    initial_state = {"messages": [HumanMessage(content=req.message)]}
+
+    async def event_generator():
+        """The generator function that yields server-sent events with detailed agent state."""
+        try:
+            # Yield a start event
+            yield f"data: {json.dumps({'type': 'start', 'session_id': session_id})}\n\n"
+
+            # Use `astream` to get real-time updates from the graph
+            async for chunk in AGENT.astream(initial_state, config=config):
+                
+                # Check for updates from the 'agent' node
+                if "agent" in chunk:
+                    agent_messages = chunk["agent"].get("messages", [])
+                    if agent_messages:
+                        latest_message = agent_messages[-1]
+                        
+                        # If the agent decides to call a tool, stream that information
+                        if latest_message.tool_calls:
+                            tool_names = [tc['name'] for tc in latest_message.tool_calls]
+                            yield f"data: {json.dumps({'type': 'tool_call', 'tools': tool_names})}\n\n"
+                        
+                        # If the agent generates a text response, stream the token
+                        if latest_message.content:
+                            yield f"data: {json.dumps({'type': 'token', 'content': latest_message.content})}\n\n"
+
+                # Check for updates from the 'tools' node (after a tool has run)
+                if "tools" in chunk:
+                    tool_messages = chunk["tools"].get("messages", [])
+                    if tool_messages:
+                        # Stream the actual output from the tool for debugging purposes
+                        tool_outputs = [msg.content for msg in tool_messages]
+                        yield f"data: {json.dumps({'type': 'tool_result', 'outputs': tool_outputs})}\n\n"
+                
+                await asyncio.sleep(0.05) # Small delay for smoother streaming
+
+            # Yield an end event once the stream is complete
+            yield f"data: {json.dumps({'type': 'end', 'session_id': session_id})}\n\n"
+
+        except Exception as e:
+            print(f"Streaming error for user {req.user_id}: {e}")
+            error_payload = json.dumps({"type": "error", "content": str(e)})
+            yield f"data: {error_payload}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+
+# ==============================================================================
+# 6. Server Entrypoint
+# ==============================================================================
 if __name__ == "__main__":
     print("=" * 50)
-    print("🚀 Initiating OneAgent⚡Gemini")
+    print("🚀 OneAgent API server starting...")
     print("=" * 50)
 
     if not check_gemini_connection():
-        print("\n❌ Cannot start server: Gemini API not accessible")
-        print("Please check your GOOGLE_API_KEY and internet connection.")
-        input("Press Enter to exit...")
+        print("\n❌ CRITICAL: Cannot start server. Gemini API is not accessible.")
         sys.exit(1)
 
     port = int(os.getenv("PORT", 8000))
-    print(f"\n🌐 Starting server on http://localhost:{port}")
-    print(f"📖 API docs available at http://localhost:{port}/docs")
-    print(f"❤️  Health check at http://localhost:{port}/health")
-    print("\n⏹️  Press Ctrl+C to stop the server")
+    print(f"\n🌐 Server running on http://localhost:{port}")
+    print(f"📖 API docs at http://localhost:{port}/docs")
+    print("⏹️ Press Ctrl+C to stop.")
 
-    try:
-        uvicorn.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            reload=False,  # Disable reload for stability
-            access_log=True,
-        )
-    except KeyboardInterrupt:
-        print("\n👋 Server stopped gracefully")
-    except Exception as e:
-        print(f"\n❌ Server error: {e}")
-        input("Press Enter to exit...")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

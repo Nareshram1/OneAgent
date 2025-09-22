@@ -1,307 +1,191 @@
-# agent_setup.py - LangGraph Implementation
 import os
-from typing import Annotated, Sequence, TypedDict, Dict, Any
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_core.tools import tool
+from typing import Annotated, Sequence, TypedDict, Optional
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolExecutor, ToolInvocation
 from langgraph.graph.message import add_messages
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 from tools import create_expense, create_note, fetch_expenses, fetch_notes
 from dotenv import load_dotenv
 from pathlib import Path
+from langchain_core.tools import tool
+import datetime
+import logging
+# ==============================================================================
+# 1. Setup Environment and LLM
+# ==============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-# =====================
-# Load environment vars
-# =====================
-BASE_DIR = Path(__file__).parent
-ENV_FILE = BASE_DIR / ".env"
-load_dotenv(ENV_FILE)
-
-# Load Gemini API key
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Configure Gemini model
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     temperature=0.2,
-    max_output_tokens=512,
     google_api_key=GOOGLE_API_KEY,
-    transport="rest"
 )
 
-# =====================
-# Define State
-# =====================
+# ==============================================================================
+# 2. Define More Robust and Modern Tools
+# - Tools now summarize data to be token-efficient and avoid context overflows.
+# ==============================================================================
+@tool
+def create_expense_record(
+    user_id: Annotated[str, "The unique identifier for the user."],
+    amount: Annotated[float, "The monetary value of the expense."],
+    description: Annotated[str, "A brief description of what the expense was for."],
+    date: Annotated[Optional[str], "The date of the expense in YYYY-MM-DD format. Optional."] = None,
+) -> str:
+    """Creates a new expense record for a given user."""
+    try:
+        res = create_expense(user_id, amount, description, date)
+        return f"Successfully created expense: {res}"
+    except Exception as e:
+        return f"Error creating expense: {e}"
+
+@tool
+def create_note_record(
+    user_id: Annotated[str, "The unique identifier for the user."],
+    text: Annotated[str, "The content of the note to be saved."],
+) -> str:
+    """Creates a new note for a given user."""
+    try:
+        res = create_note(user_id, text)
+        return f"Successfully created note: {res}"
+    except Exception as e:
+        return f"Error creating note: {e}"
+
+@tool
+def fetch_user_expenses(
+    user_id: Annotated[str, "The unique identifier for the user."],
+    limit: Annotated[int, "The maximum number of expenses to retrieve."] = 20,
+) -> str:
+    """
+    Fetches and summarizes the most recent expense records for a given user.
+    Instead of returning raw data, this tool returns a concise, formatted summary
+    to be efficient and easy for the language model to understand.
+    """
+    try:
+        print("DEBUG, userID parsed by agent for fetch_expenses:", user_id)
+        expenses = fetch_expenses(user_id, limit)
+        
+        # --- START OF FIX ---
+        # For debugging, print the raw data to see its structure
+        print(f"DEBUG: Raw expenses data from fetch_expenses: {expenses}")
+        
+        if not expenses:
+            return "No expenses found for this user."
+
+        # Ensure expenses is a list of dictionaries
+        if not isinstance(expenses, list) or not all(isinstance(item, dict) for item in expenses):
+             return f"Error: The fetched data is not in the expected format (a list of dictionaries). Data: {expenses}"
+
+        total_expenses = len(expenses)
+        # Make sure amount exists and is a number before summing
+        total_amount = sum(item.get('amount', 0) for item in expenses if isinstance(item.get('amount'), (int, float)))
+        
+        summary = f"Found {total_expenses} expenses totaling {total_amount:.2f}.\n\n"
+        summary += "Here are the most recent expenses:\n"
+        
+        for expense in expenses[:5]:
+            category_info = expense.get('categories')
+            category = category_info.get('name', 'N/A') if isinstance(category_info, dict) else 'N/A'
+            
+            date_str = expense.get('created_at', '')
+            formatted_date = 'N/A' # Default value
+            if date_str:
+                try:
+                    date_obj = datetime.datetime.fromisoformat(str(date_str).replace('Z', '+00:00'))
+                    formatted_date = date_obj.strftime('%b %d, %Y') # e.g., Sep 22, 2025
+                except (ValueError, TypeError):
+                    logging.warning(f"Could not parse date: {date_str}")
+
+            amount = expense.get('amount', 0)
+            desc = expense.get('description') or category
+            summary += f"- **Date:** {formatted_date}, **Amount:** {amount:.2f}, **Details:** {desc}\n"
+        # --- END OF FIX ---
+            
+        return summary
+    except Exception as e:
+        logging.error(f"Error in fetch_user_expenses tool: {e}")
+        return f"Error fetching expenses: {e}"
+
+
+@tool
+def fetch_user_notes(
+    user_id: Annotated[str, "The unique identifier for the user."],
+    limit: Annotated[int, "The maximum number of notes to retrieve."] = 20,
+) -> str:
+    """
+    Fetches and summarizes the most recent notes for a given user.
+    Returns a concise summary instead of raw data.
+    """
+    try:
+        notes = fetch_notes(user_id, limit)
+        if not notes:
+            return "No notes found for this user."
+
+        summary = f"Found {len(notes)} notes. Here are the 5 most recent:\n"
+        for note in notes[:5]:
+             summary += f"- {note.get('text', 'No content')}\n"
+        return summary
+    except Exception as e:
+        return f"Error fetching notes: {e}"
+
+# List of tools for the agent
+tools = [
+    create_expense_record,
+    create_note_record,
+    fetch_user_expenses,
+    fetch_user_notes,
+]
+
+# Bind the tools to the LLM
+llm_with_tools = llm.bind_tools(tools)
+
+# ==============================================================================
+# 3. Define Agent State and Graph Structure
+# ==============================================================================
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
-# =====================
-# Define Tools using @tool decorator
-# =====================
-@tool
-def tool_create_expense(input_str: str) -> str:
-    """Create a new expense record. Input format: user_id=USER_ID;amount=AMOUNT;description=DESCRIPTION;date=YYYY-MM-DD"""
-    try:
-        pairs = dict(x.split('=', 1) for x in input_str.split(';') if '=' in x)
-        res = create_expense(
-            pairs['user_id'],
-            float(pairs['amount']),
-            pairs.get('description', 'expense'),
-            pairs.get('date')
-        )
-        return str(res)
-    except Exception as e:
-        return f"Error creating expense: {str(e)}"
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a helpful and efficient financial assistant. Your primary job is to help users manage their expenses and notes by using the available tools.
 
-@tool
-def tool_create_note(input_str: str) -> str:
-    """Create a new note. Input format: user_id=USER_ID;text=NOTE_TEXT"""
-    try:
-        pairs = dict(x.split('=', 1) for x in input_str.split(';') if '=' in x)
-        res = create_note(pairs['user_id'], pairs['text'])
-        return str(res)
-    except Exception as e:
-        return f"Error creating note: {str(e)}"
-
-@tool
-def tool_fetch_expenses(input_str: str) -> str:
-    """Fetch user expenses. Input format: user_id=USER_ID;limit=NUMBER (optional, default 20)"""
-    try:
-        pairs = dict(x.split('=', 1) for x in input_str.split(';') if '=' in x)
-        res = fetch_expenses(pairs['user_id'], int(pairs.get('limit', 20)))
-        return str(res)
-    except Exception as e:
-        return f"Error fetching expenses: {str(e)}"
-
-@tool
-def tool_fetch_notes(input_str: str) -> str:
-    """Fetch user notes. Input format: user_id=USER_ID;limit=NUMBER (optional, default 20)"""
-    try:
-        pairs = dict(x.split('=', 1) for x in input_str.split(';') if '=' in x)
-        res = fetch_notes(pairs['user_id'], int(pairs.get('limit', 20)))
-        return str(res)
-    except Exception as e:
-        return f"Error fetching notes: {str(e)}"
-
-@tool
-def tool_analyze(input_str: str) -> str:
-    """Analyze expenses and notes data to provide insights. Input: Combined JSON data or structured text with expense and note information"""
-    try:
-        analysis_prompt = f"""You are a financial analysis assistant. Analyze the following data and provide insights:
-
-{input_str}
-
-Provide a clear, structured analysis with:
-📌 Key Findings
-📊 Spending Patterns  
-🧩 Correlations
-✅ Recommendations
-
-Format output to be visually easy to read in plain text with tables and bullet points where appropriate."""
-        
-        messages = [HumanMessage(content=analysis_prompt)]
-        response = llm.invoke(messages)
-        return response.content
-    except Exception as e:
-        return f"Error during analysis: {str(e)}"
-
-# =====================
-# Create Tools List
-# =====================
-tools = [
-    tool_create_expense,
-    tool_create_note,
-    tool_fetch_expenses,
-    tool_fetch_notes,
-    tool_analyze
-]
-
-# Bind tools to LLM
-llm_with_tools = llm.bind_tools(tools)
-
-# Create tool executor
-tool_executor = ToolExecutor(tools)
-
-# =====================
-# Define Node Functions
-# =====================
-def should_continue(state: AgentState) -> str:
-    """Determine whether to continue or end the conversation."""
-    messages = state['messages']
-    last_message = messages[-1]
-    
-    # If the LLM makes a tool call, then we route to the "tools" node
-    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-        return "tools"
-    # Otherwise, we stop (reply to the user)
-    return END
-
-def call_model(state: AgentState) -> Dict[str, Any]:
-    """Call the model with the current state."""
-    messages = state['messages']
-    
-    # Add system message for the agent's behavior
-    system_message = """You are a helpful financial assistant that can:
-1. Create expense records
-2. Create notes
-3. Fetch expense data
-4. Fetch notes
-5. Analyze financial data and provide insights
-
-When users ask to create, fetch, or analyze data, use the appropriate tools.
-Be helpful and provide clear responses. For analysis requests, fetch the relevant data first, then analyze it."""
-    
-    # Prepend system message if not already present
-    if not messages or not isinstance(messages[0], AIMessage):
-        messages = [AIMessage(content=system_message)] + list(messages)
-    
-    response = llm_with_tools.invoke(messages)
-    return {"messages": [response]}
-
-def call_tools(state: AgentState) -> Dict[str, Any]:
-    """Execute tools based on the tool calls in the last message."""
-    messages = state['messages']
-    last_message = messages[-1]
-    
-    # We construct ToolInvocation for each tool call
-    tool_invocations = []
-    for tool_call in last_message.tool_calls:
-        tool_invocations.append(
-            ToolInvocation(
-                tool=tool_call["name"],
-                tool_input=tool_call["args"],
-            )
-        )
-    
-    # Execute tools and collect responses
-    responses = tool_executor.batch(tool_invocations)
-    
-    # Convert responses to ToolMessages
-    tool_messages = []
-    for response, tool_call in zip(responses, last_message.tool_calls):
-        tool_messages.append(
-            ToolMessage(
-                content=str(response),
-                tool_call_id=tool_call["id"],
-            )
-        )
-    
-    return {"messages": tool_messages}
-
-# =====================
-# Build the Graph
-# =====================
-workflow = StateGraph(AgentState)
-
-# Add nodes
-workflow.add_node("agent", call_model)
-workflow.add_node("tools", call_tools)
-
-# Set the entrypoint
-workflow.set_entry_point("agent")
-
-# Add conditional edges
-workflow.add_conditional_edges(
-    "agent",
-    should_continue,
-    {
-        "tools": "tools",
-        END: END,
-    }
+- **Crucially, you must always determine the `user_id` to use the tools.** The user might provide it directly in their message (e.g., "for user XYZ" or "my ID is 123"). Extract it from their query.
+- When asked to fetch data, use the appropriate tool and present the summary it returns directly to the user in a clean, readable format.
+- If a user asks for analysis, provide insights based *only* on the summary data you have.
+- Always be clear about the results of an action (e.g., "Successfully created...").""",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
 )
 
-# Add normal edge from tools to agent
+agent_runnable = prompt | llm_with_tools
+
+# Define the nodes of the graph
+def agent_node(state: AgentState):
+    return {"messages": [agent_runnable.invoke(state)]}
+
+tool_node = ToolNode(tools)
+
+def should_continue(state: AgentState) -> str:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return END
+
+# ==============================================================================
+# 4. Construct and Compile the Graph
+# ==============================================================================
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tool_node)
+workflow.set_entry_point("agent")
+workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
-
-# Compile the graph
 AGENT = workflow.compile()
-
-# =====================
-# Helper Functions
-# =====================
-def run_agent(query: str, user_id: str = None) -> str:
-    """
-    Run the agent with a query.
-    
-    Args:
-        query: The user's question or command
-        user_id: Optional user ID for context
-        
-    Returns:
-        The agent's response
-    """
-    # Add user_id context if provided
-    if user_id:
-        query = f"[User ID: {user_id}] {query}"
-    
-    # Create initial state
-    initial_state = {
-        "messages": [HumanMessage(content=query)]
-    }
-    
-    # Run the agent
-    result = AGENT.invoke(initial_state)
-    
-    # Return the last AI message
-    for message in reversed(result["messages"]):
-        if isinstance(message, AIMessage):
-            return message.content
-    
-    return "No response generated"
-
-async def run_agent_async(query: str, user_id: str = None) -> str:
-    """
-    Async version of run_agent.
-    """
-    if user_id:
-        query = f"[User ID: {user_id}] {query}"
-    
-    initial_state = {
-        "messages": [HumanMessage(content=query)]
-    }
-    
-    result = await AGENT.ainvoke(initial_state)
-    
-    for message in reversed(result["messages"]):
-        if isinstance(message, AIMessage):
-            return message.content
-    
-    return "No response generated"
-
-def stream_agent(query: str, user_id: str = None):
-    """
-    Stream the agent's response.
-    """
-    if user_id:
-        query = f"[User ID: {user_id}] {query}"
-    
-    initial_state = {
-        "messages": [HumanMessage(content=query)]
-    }
-    
-    for chunk in AGENT.stream(initial_state):
-        yield chunk
-
-# =====================
-# Example Usage
-# =====================
-if __name__ == "__main__":
-    # Test the agent
-    print("🤖 Financial Assistant Agent Ready!")
-    print("=" * 50)
-    
-    # Example queries
-    test_queries = [
-        "Create an expense for user123: amount=50.0, description=Coffee, date=2024-01-15",
-        "Fetch expenses for user123",
-        "Create a note for user123: text=Had coffee meeting with client",
-        "Analyze my financial data for user123"
-    ]
-    
-    for query in test_queries:
-        print(f"\n🔍 Query: {query}")
-        print("🤖 Response:")
-        response = run_agent(query)
-        print(response)
-        print("-" * 30)
